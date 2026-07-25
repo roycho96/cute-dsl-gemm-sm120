@@ -25,11 +25,9 @@ per pass), cuBLAS measured first. Correctness gated at rel-err < 2e-2 vs an fp32
 reference; measured max 2.6–3.1e-3 (cuBLAS's own bf16 error). Throughput is
 TFLOP/s = 2·M·N·K / time.
 
-The SM clock is locked at 2595 MHz from the Windows host (`nvidia-smi -lgc`); the
-WSL2 workload inherits the physical GPU's locked clock, which WSL2 itself cannot
-set. Both kernels therefore run at the same fixed clock. The roofline is fixed
-too: on GeForce, bf16 tensor with fp32 accumulate runs at 512 FLOP/SM/clock —
-half the fp16-accumulate rate — which is **47.8 TFLOP/s** at 36 SM × 2595 MHz.
+The SM clock is locked at 2595 MHz, so both kernels run at the same fixed clock.
+Roofline: on GeForce, bf16 with fp32 accumulate runs at 512 FLOP/SM/clock (half
+the fp16-accumulate rate) = **47.8 TFLOP/s** at 36 SM × 2595 MHz.
 
 ## Results
 
@@ -99,11 +97,9 @@ along N. bench.py config strings: `64,64,64:4,1,1:e2:o2`, `128,128,64:n`,
 
 ## Caveats
 
-- Clock locked at 2595 MHz from the Windows host; WSL2 cannot set GPU clocks
-  itself (the host driver owns clock management) but inherits the host's lock.
 - Stream-K enforces one CTA per SM: with two co-resident, the fixup path corrupts
-  the sibling CTA's in-flight fragments (reproducible; root cause not established
-  without compute-sanitizer under WSL2/WDDM). Excluded by construction.
+  the sibling CTA's in-flight fragments (reproducible; root cause not established).
+  Excluded by construction.
 - NVIDIA's example epilogue reuses TMA-store buffers when epi_stage < #subtiles
   (tileM·tileN / (64·32)) and returns wrong results; all configs keep
   epi_stage ≥ #subtiles.
