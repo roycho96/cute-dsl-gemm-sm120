@@ -1,191 +1,121 @@
 # CuTe DSL GEMM vs cuBLAS on RTX 5060 Ti (sm_120)
 
-A batched bf16 GEMM in CuTe DSL (CUTLASS 4.x Python), tuned and extended to match
-or beat cuBLAS on a consumer Blackwell card. bf16 in, fp32 accumulate, bf16 out;
-C = A·Bᵀ (nn.Linear / TN layout). The cuBLAS baseline is `torch.matmul(A, B.t())`
-on the same tensors in the same process.
+bf16 in / fp32 accumulate / bf16 out, C = A·Bᵀ (nn.Linear / TN layout). cuBLAS
+baseline is `torch.matmul(A, B.t())` on the same tensors in the same process.
 
-Environment: NVIDIA GeForce RTX 5060 Ti (36 SM, sm_120), CUDA 13.0,
+Environment: RTX 5060 Ti (36 SM, sm_120), CUDA 13.2, driver 595.79,
 torch 2.11.0+cu130, nvidia-cutlass-dsl 4.5.0.
 
-## What the kernel is
+## Kernel
 
-`gemm_sm120.py` is a fork of NVIDIA's `examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py`
-(`Sm120GemmKernel`, BSD-3). The TMA/MMA/pipeline structure of the mainloop and
-epilogue is NVIDIA's. This repo adds three things on top:
+Fork of NVIDIA `blackwell_geforce/dense_gemm.py` (`Sm120GemmKernel`, BSD-3).
+NVIDIA's TMA/MMA/pipeline mainloop and epilogue, unchanged. Added here: tuning
+knobs the example hardcodes (atom layout, occupancy, pipeline depth, epilogue
+stages, raster, register budgets, MMA shape), a stream-K scheduler, and
+resolution of the two mainloop TODOs. Instruction path: TMA loads,
+warp-specialized producer/consumer (1 DMA + 4 MMA warps, `setmaxnreg` 40/232),
+`ldmatrix.x4` + `mma.sync m16n8k16`, mbarrier pipeline, TMA-store epilogue — the
+Ampere-class tensor path cuBLAS also runs on this card
+(`cutlass_80_tensorop_bf16_s16816gemm_64x64_32x6`).
 
-- Tuning knobs the example hardcodes: MMA atom layout, occupancy, pipeline depth
-  (`max_ab_stage`), epilogue stages, scheduler raster direction, register budgets,
-  and MMA instruction shape.
-- A stream-K scheduler (`stream_k=True`) — new code, described below.
-- Resolution of the example's two mainloop TODOs.
+## Method
 
-sm_120 (consumer Blackwell) has no tcgen05/UMMA/TMEM and no usable cluster
-multicast; those belong to SM100 (datacenter Blackwell). The instruction path here
-is TMA global-to-shared loads, a warp-specialized producer/consumer split (1 DMA
-warp + 4 MMA warps, `setmaxnreg` 40/232), `ldmatrix.x4` feeding `mma.sync m16n8k16`,
-a multi-stage mbarrier pipeline, and a TMA-store epilogue. This is the same
-Ampere-class tensor path cuBLAS runs on this card: its 2048-cube kernel is
-`cutlass_80_tensorop_bf16_s16816gemm_64x64_32x6_tn_align8`.
+CUDA-event timing, both sides CUDA-graph captured, 20 passes per shape (median
+per pass), cuBLAS measured first. Correctness gated at rel-err < 2e-2 vs an fp32
+reference; measured max 2.6–3.1e-3 (cuBLAS's own bf16 error). Throughput is
+TFLOP/s = 2·M·N·K / time.
+
+Clocks float (WSL2 blocks `nvidia-smi -lgc`), so results are given two ways: vs
+cuBLAS, and vs the bf16/fp32-accumulate roofline recomputed at the SM clock
+sampled during each run. On GeForce, bf16 tensor with fp32 accumulate runs at
+512 FLOP/SM/clock — half the fp16-accumulate rate — which is 47.41 TFLOP/s at
+the 2572 MHz rated boost. The card sustains ~2.7 GHz under load, so peak is
+recomputed per run at the measured clock (roofline % carries ±~2% from clock
+sampling).
 
 ## Results
 
-11 shapes. CUDA-event timing, ≥20 warmup, 40–120 timed samples per pass (small
-shapes amortized to ≥2 ms/sample), median reported, both sides CUDA-graph captured,
-cuBLAS measured first per shape. Every config clears rel-err < 2e-2 against an fp32
-reference; measured max rel-err is 2.6–3.1e-3, the same as cuBLAS's own bf16 error.
-
-Clocks float (WSL2, no clock lock), so the full set ran in three independent passes.
-The ratio column is the median across passes with the observed range. The kernel's
-own throughput is far steadier than the baseline's: on 2048-cube it holds
-48.89–49.00 TFLOP/s (σ≈0.1%) while cuBLAS swings 47.77–49.02 (σ≈1.3%), so most of
-the ratio movement on the close shapes is cuBLAS clock variance, not this kernel.
-
-| M,N,K | config (scheduler) | mine TFLOP/s | cuBLAS TFLOP/s | ratio, median [range] | verdict |
+| M,N,K | config | TFLOP/s | vs cuBLAS | vs roofline | |
 |---|---|---|---|---|---|
-| 512,512,512 | 64³ a411 e2 o2 (DP) | 25.06 | 25.32 | 100.1% [98.7–102.1] | tie (latency-bound, ~10.7 us) |
-| 1024,1024,1024 | 64³ a411 e2 o2 (DP) | 40.84 | 40.97 | 100.0% [99.7–100.3] | tie |
-| 2048,2048,2048 | 64³ a411 e2 o2 (DP) | 48.91 | 49.02 | 99.8% [99.5–102.6] | tie (ncu: at ceiling) |
-| 4096,4096,4096 | 128×128×64 (stream-K) | 50.17 | 50.03 | 101.0% [99.5–102.8] | tie, SK-leaning win |
-| 8192,8192,8192 | 128×128×64 (stream-K) | 49.42 | 47.75 | 103.5% [103.5–105.8] | **win** |
-| 8192,4096,11008 | 128×128×64 raster-N (stream-K) | 50.78 | 48.77 | 104.2% [104.1–104.4] | **win** |
-| 2048,8192,8192 | 128×128×64 (DP) | 50.20 | 48.42 | 103.8% [103.7–104.4] | **win** |
-| 16384,4096,4096 | 128×128×64 raster-N (DP) | 50.96 | 48.25 | 105.8% [105.3–106.0] | **win** |
-| 4096,4096,512 (thin-K) | 64³ a411 e2 o2 (DP) | 48.09 | 47.08 | 102.3% [102.1–102.3] | **win** |
-| 8192,1024,1024 | 64³ a411 e2 o2 (DP) | 49.14 | 48.62 | 101.3% [101.1–101.9] | **win** |
-| 6144,4096,4096 | 128×128×64 raster-N (DP) | 50.53 | 48.49 | 104.1% [104.1–104.2] | **win** |
+| 512,512,512 | 64³ o2 | 25.0 | 100.5% | 48% | tie |
+| 1024,1024,1024 | 128³ | 40.2 | 99.9% | 78% | tie |
+| 2048,2048,2048 | 64³ o2 | 46.7 | 98.1% | 91% | tie |
+| 8192,1024,1024 | 128³ | 46.1 | 98.4% | 91% | tie |
+| 4096,4096,512 | 128³ | 46.3 | 102.9% | 92% | win |
+| 4096,4096,4096 | 128³ SK | 49.2 | 105.1% | 98% | win |
+| 6144,4096,4096 | 128³ N | 49.3 | 105.6% | 99% | win |
+| 8192,8192,8192 | 128³ SK | 49.1 | 104.6% | 100% | win |
+| 8192,4096,11008 | 128³ N SK | 49.3 | 105.0% | 100% | win |
+| 2048,8192,8192 | 128³ | 49.6 | 106.2% | 100% | win |
+| 16384,4096,4096 | 128³ N | 49.7 | 106.4% | 100% | win |
 
-Config key: `a411` = MMA atom (4,1,1); `64³ e2 o2` = 64×64×64 tile, epilogue stage 2,
-occupancy 2 (grid 72); `128×128×64` = epilogue stage 8, occupancy 1 (grid 36);
-`sk` = stream-K. TFLOP/s columns come from the final pass (`final.jsonl`); the ratio
-statistics fold in all three passes.
+**7 win / 4 tie / 0 loss.** Run-to-run σ is 0.1–0.3%; the kernel is steadier than
+cuBLAS, whose σ reaches 1.3%. The wins are the large compute-bound shapes, all at
+98–100% of the roofline — the same ceiling cuBLAS hits, so the +3–6% over cuBLAS
+is real but small. The ties are the small, thin, and latency-bound shapes, at
+parity with cuBLAS.
 
-Bottom line: 0 losses. 7 shapes beat cuBLAS beyond clock noise (+1.3% to +5.8%).
-The 4 compute-bound squares (512–4096) tie at the hardware ceiling, with 4096-cube
-leaning to a win under stream-K. Those ties are real parity, not unfinished tuning —
-see "Why the squares tie" below.
+The small and thin-K shapes want a 128-tile, not a 64-tile: moving to it took
+1024³ from 96% to 100% and 4096×4096×512 from 96% to 103% of cuBLAS. A 64-tile
+under-fills them.
 
-## What the knobs are worth
+## % of peak, and the >100% trap
 
-Per-shape lever ranking, strongest first: occupancy 2 (small tiles), then tile size,
-then raster direction, then epilogue stages. On top of those, stream-K adds +0.5–3%
-but only on large shapes with big remainder waves and occupancy-1 winners, and atom
-(4,1,1) adds +0.2–0.9% on 64³ tiles. Levers that did nothing: scheduler swizzle,
-`mma_regs` 232→240, 128×64 / 64×128 tiles (95.7–98.1% everywhere), and
-`sk_extra_waves` ≥ 1 (worse — it splits more tiles than the load balance is worth).
+Every shape is ≤100% of the roofline when peak is taken at the actual clock.
+Dividing instead by the rated-clock peak (47.41 @ 2572 MHz) makes the large
+shapes read 103–106% — an artifact: the card runs ~2.7 GHz, not 2.57, so the
+rated-clock denominator is too small. Recompute peak at the measured clock, or
+lock clocks (WSL2 blocks that).
 
-## Stream-K scheduler
+## Stream-K
 
-Stream-K splits the tile space into full data-parallel waves plus a remainder. The
-remainder's (tile, k-tile) units are divided contiguously across all CTAs. The CTA
-that owns a tile's k=0 segment waits for the other CTAs contributing to that tile,
-folds their fp32 partials from a per-CTA workspace slot, then runs the normal
-TMA-store epilogue. The grid is exactly the persistent CTA count, so every
-contributor is resident and the owner's wait cannot deadlock.
+Stream-K flattens the persistent schedule's remainder into (tile, k-tile) units
+divided evenly over all CTAs, with a cross-CTA fp32 fixup (per-CTA workspace slot
++ release/acquire flag). It matters on one pattern: a low 128-tile count (a small
+non-multiple of 36 SMs) with deep K.
 
-Getting the cross-CTA reduction correct on sm_120 took three memory-ordering
-findings, each pinned down by 100–150 launches per variant (broken variants failed
-anywhere from 1/120 to 150/150):
+| M,N,K | 128-tiles | 128³ DP | 128³ SK | 64³ DP |
+|---|---|---|---|---|
+| 768,1024,8192 | 48 (1.3 wave) | 65% | 85% | 84% |
+| 640,1152,8192 | 45 (1.3 wave) | 61% | 81% | 94% |
+| 1152,1152,8192 | 81 (2.3 wave) | 73% | 88% | 79% |
 
-1. Relaxed global reductions (`red.global`) are fire-and-forget. Neither a later
-   `fence.acq_rel.gpu` nor a later same-thread release reliably orders them ahead of
-   a release-flag publish. Partials are written with plain stores, which the release
-   flag does cover.
-2. Weak loads can come back stale from the reader's L1 even after an acquire fence,
-   because the L1 is not invalidated. The fold uses strong relaxed loads
-   (`ld.relaxed.gpu.global`), which read from L2 (the coherence point) but still
-   pipeline like ordinary loads.
-3. The flag is a release-increment / acquire-poll pair. Per-thread fences plus a CTA
-   barrier put all 128 threads' stores under the one release.
+(% of roofline.) Here the 128-tile data-parallel kernel wave-quantizes hard
+(61–73%) — the tail wave leaves most SMs idle — and stream-K recovers +20–34%. A
+smaller 64-tile is an alternative (more tiles, less quantization) and sometimes
+wins outright, so benchmark both `:sk` and a 64-tile. On the large benchmark
+shapes (many tiles, near-integer waves) stream-K is within noise of data-parallel:
+the persistent scheduler already absorbs the tail. Stream-K also needs deep K —
+with shallow K the fixup overhead outweighs the gain.
 
-The final protocol ran >2,000 verification launches (single and CUDA-graph bursts)
-across 10 shape/config combinations with 0 failures, worst rel-err 2.6–3.1e-3.
+Correctness needed three sm_120 memory-ordering facts: relaxed `red.global` is
+not ordered by a later fence or release (partials use plain stores under the
+release flag); weak loads can return stale from L1 across an acquire fence (the
+fold uses `ld.relaxed.gpu`); the flag is a release-increment / acquire-poll.
+0 failures over >2,000 verification launches.
 
-Where it helps, measured against data-parallel on all 11 shapes:
+## Config key
 
-- Wins: 8192-cube (+0.7–2.9%; its 28/36 remainder wave is the biggest tail in the
-  set), 4096-cube (+0.5%), 8192×4096×11008 (+0.2%). These are the shipped configs.
-- Ties: the other large rectangles — tails ≤1.5% of total waves, so fixup overhead
-  cancels the gain.
-- Losses: every shape whose best data-parallel config uses occupancy 2 (512–2048
-  squares, thin-K, 8192×1024×1024). Stream-K runs one CTA per SM (below), so it gives
-  up the co-residency overlap occupancy 2 buys on small tiles — worth 2–35%, far more
-  than any tail.
+`64³ o2` = 64×64×64 tile, atom (4,1,1), epilogue stage 2, occupancy 2 (grid 72).
+`128³` = 128×128×64 tile, epilogue stage 8, occupancy 1 (grid 36). `N` = raster
+along N. `SK` = stream-K. bench.py config strings: `64,64,64:4,1,1:e2:o2`,
+`128,128,64:n:sk` (`sk` = stream-K, `xN` = extra stream-K waves, `k8` = m16n8k8).
 
-### The occupancy-2 limitation (unresolved)
+## Caveats
 
-With two of these CTAs co-resident on one SM, running the stream-K fixup path
-corrupts in-flight operand fragments of the sibling CTA. It reproduces with any cheap
-contributor-path code, even when every store is dynamically unreachable, and clears
-only when every workspace op carries per-op release semantics — which costs more than
-the tail it would save. I could not establish root cause (no compute-sanitizer under
-WSL2/WDDM). The launch-time register allocation (96/thread static) does not reserve
-the `setmaxnreg` targets (232/40), which is spec-gray and harmless only on an
-exclusive SM, but register-budget experiments neither confirmed nor fixed it.
-
-So stream-K enforces one CTA per SM structurally: its per-CTA smem footprint exceeds
-half the SM's capacity, so the hardware cannot co-schedule a second. The
-data-parallel occupancy-2 configs share no cross-CTA code and are unaffected.
-
-## The two upstream TODOs
-
-**"leverage ldmatrix.x4"** — resolved by measurement, not new code. The example's ×2
-factor on the N permutation already pairs two n8 MMA value tiles, so each warp's B
-fragment spans a 16×16 smem block per k-block: exactly one `ldmatrix.x4` footprint.
-SASS confirms it — every LDSM in the kernel is `LDSM.16.M88.4` (32 instances for atom
-(2,2,1), 40 for (4,1,1)), with zero `.1`/`.2` variants. It holds when
-`atom_layout[1] == 1` too, which makes atom (4,1,1) usable on 64-wide tiles: it
-measured +0.2–0.9% over (2,2,1) with consistent sign on all five shapes tried, and is
-now the default for 64³ shapes. The TODO comment is replaced with an explanation of
-why the permutation is what enables the x4 path.
-
-**"remove this hard code" (`mma_inst_mnk`)** — now a constructor knob, validated
-against the two shapes `MmaF16BF16Op` accepts. `(16,8,8)` reaches 51.0% of cuBLAS on
-2048-cube, exactly the 2× instruction-issue penalty you would expect, so `(16,8,16)`
-(the widest f16/bf16 `mma.sync` on sm_120) stays the default. The knob documents that
-the choice is deliberate.
-
-## Why the squares tie
-
-The compute-bound squares (512–2048, and 4096 without stream-K) tie because both
-kernels sit at the same hardware ceiling, not because tuning stopped early. ncu
-head-to-head on 2048³, same shape and process class:
-
-- This kernel: HMMA-pipe issue 48.4% of peak-sustained, DRAM 9.2%, 18.1% warps
-  active, 415 us under ncu.
-- cuBLAS (`cutlass_80_tensorop_bf16_s16816gemm_64x64_32x6`): HMMA 48.9%, DRAM 9.2%,
-  16.4% warps active, 414 us.
-
-Same instruction class, same tile class, same utilization, 0.3% apart. There is no
-≥1.5% win physically available on these shapes at matched clocks. Claiming one from a
-lucky pass — the 102.6% sample in the 2048³ range, or 102.1% at 512³ — would just be
-catching the baseline on a slow clock.
-
-## Limitations and caveats
-
-- No clock lock (`nvidia-smi -lgc` denied under WSL2). Over a day the cuBLAS baseline
-  on a fixed shape moved ±1.3% (2048³: 47.77–49.02 TFLOP/s) while this kernel moved
-  ±0.15%. Read any ratio inside ~100±1.5% as parity; the table ranges make that
-  visible.
-- Stream-K is restricted to one CTA per SM. The occupancy-2 corruption is
-  reproducible, unexplained at root cause, and excluded by construction rather than
-  fixed.
-- sm_120 memory-ordering quirks (stream-K section): relaxed `red.global` unordered by
-  later fences/releases; weak loads stale in L1 across acquire fences.
-- NVIDIA's example has an epilogue buffer-reuse race: `epi_stage` < #subtiles
-  (tileM·tileN / (64·32)) reuses TMA-store buffers before the store finishes and
-  returns wrong results. All configs keep `epi_stage ≥ #subtiles`.
-- `atom_layout` (1,4,1) everywhere, and (4,1,1) on 128-wide tiles, miscompute in this
-  DSL version (verified, excluded). (4,1,1) is correct on 64-wide tiles and used there.
-- Measurement order is cuBLAS-first per shape (coolest GPU for the baseline), which is
-  conservative for the reported wins.
+- No clock lock under WSL2; ratios inside ~100±1.5% are parity.
+- Stream-K enforces one CTA per SM: with two co-resident, the fixup path corrupts
+  the sibling CTA's in-flight fragments (reproducible; root cause not established
+  without compute-sanitizer under WSL2/WDDM). Excluded by construction.
+- NVIDIA's example epilogue reuses TMA-store buffers when epi_stage < #subtiles
+  (tileM·tileN / (64·32)) and returns wrong results; all configs keep
+  epi_stage ≥ #subtiles.
+- atom (1,4,1) everywhere and (4,1,1) on 128-wide tiles miscompute in this DSL
+  version (excluded); (4,1,1) is correct on 64-wide tiles.
 
 ## Files
 
-- `gemm_sm120.py` — the kernel: NVIDIA blackwell_geforce example + tuning knobs +
-  stream-K + resolved TODOs.
-- `bench.py` — harness: fp32 correctness gate + CUDA-event/CUDA-graph benchmark vs
-  `torch.matmul`. Config strings like `64,64,64:4,1,1:e2:o2:g2` or `128,128,64:n:sk`
-  (`sk` = stream-K, `xN` = extra stream-K waves, `k8` = m16n8k8 instruction).
-- `profile_one.py` — standalone single-kernel runner for ncu.
-- `final.jsonl` — the consolidated pass behind the table.
+- `gemm_sm120.py` — kernel (NVIDIA example + knobs + stream-K + resolved TODOs).
+- `bench.py` — correctness gate + CUDA-graph benchmark vs `torch.matmul`.
+- `profile_one.py` — single-kernel runner for ncu.
+- `final.jsonl` — the data behind the tables.
