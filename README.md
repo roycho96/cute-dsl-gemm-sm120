@@ -1,4 +1,4 @@
-# CuTe DSL GEMM for sm_120 (consumer Blackwell), benchmarked vs cuBLAS
+# CuTe DSL GEMM for sm_120
 
 A CuTe DSL (CUTLASS 4.x Python) batched GEMM for NVIDIA sm_120 (RTX 50-series,
 consumer Blackwell), tuned to the hardware roofline and benchmarked against
