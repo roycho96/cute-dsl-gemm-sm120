@@ -26,6 +26,21 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# Modifications Copyright (c) 2026 Sung Hyun Cho. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Derived from NVIDIA CUTLASS's
+# examples/python/CuTeDSL/blackwell_geforce/dense_gemm.py (Sm120GemmKernel).
+# The TMA/MMA/pipeline mainloop and epilogue structure is NVIDIA's, unchanged.
+# Changes and additions in this file:
+#   - stream-K scheduler (stream_k=True): flattened-remainder work division with a
+#     cross-CTA fp32 fixup (per-CTA workspace slot + release/acquire flag protocol)
+#   - tuning knobs the upstream example hardcodes: atom_layout, occupancy,
+#     max_ab_stage, epi_stage, swizzle_size, raster_along_m, load/mma register
+#     budgets, mma_inst_mnk
+#   - resolution of the two mainloop TODOs (ldmatrix.x4 path, mma_inst_mnk knob)
+#   - factored mainloop/epilogue helpers shared by both schedulers
+
 import argparse
 from typing import Tuple, Type
 
