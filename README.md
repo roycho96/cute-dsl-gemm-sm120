@@ -39,8 +39,8 @@ Correctness: every config gated on rel-err < 2e-2 vs fp32 (measured max
 2.6–3.1e-3, cuBLAS's own bf16 error). Stream-K survived >2,000 verification
 launches with 0 failures.
 
-Full table, per-shape roofline %, the stream-K data, and the ">100% of peak"
-clock artifact are in [RESULTS.md](RESULTS.md).
+Full table, per-shape roofline %, and the stream-K data are in
+[RESULTS.md](RESULTS.md).
 
 ## Run
 

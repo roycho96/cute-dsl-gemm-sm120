@@ -30,8 +30,9 @@ cuBLAS, and vs the bf16/fp32-accumulate roofline recomputed at the SM clock
 sampled during each run. On GeForce, bf16 tensor with fp32 accumulate runs at
 512 FLOP/SM/clock — half the fp16-accumulate rate — which is 47.41 TFLOP/s at
 the 2572 MHz rated boost. The card sustains ~2.7 GHz under load, so peak is
-recomputed per run at the measured clock (roofline % carries ±~2% from clock
-sampling).
+recomputed per run at the measured clock — dividing by the rated-clock 47.41
+instead would push the large shapes past 100%. Roofline % carries ±~2% from
+clock sampling.
 
 ## Results
 
@@ -53,19 +54,8 @@ sampling).
 cuBLAS, whose σ reaches 1.3%. The wins are the large compute-bound shapes, all at
 98–100% of the roofline — the same ceiling cuBLAS hits, so the +3–6% over cuBLAS
 is real but small. The ties are the small, thin, and latency-bound shapes, at
-parity with cuBLAS.
-
-The small and thin-K shapes want a 128-tile, not a 64-tile: moving to it took
-1024³ from 96% to 100% and 4096×4096×512 from 96% to 103% of cuBLAS. A 64-tile
+parity with cuBLAS. The small and thin-K shapes use a 128-tile; a 64-tile
 under-fills them.
-
-## % of peak, and the >100% trap
-
-Every shape is ≤100% of the roofline when peak is taken at the actual clock.
-Dividing instead by the rated-clock peak (47.41 @ 2572 MHz) makes the large
-shapes read 103–106% — an artifact: the card runs ~2.7 GHz, not 2.57, so the
-rated-clock denominator is too small. Recompute peak at the measured clock, or
-lock clocks (WSL2 blocks that).
 
 ## Stream-K
 
