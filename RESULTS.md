@@ -4,7 +4,7 @@ bf16 in / fp32 accumulate / bf16 out, C = A·Bᵀ (nn.Linear / TN layout). cuBLA
 baseline is `torch.matmul(A, B.t())` on the same tensors in the same process.
 
 Environment: RTX 5060 Ti (36 SM, sm_120), CUDA 13.2, driver 595.79,
-torch 2.11.0+cu130, nvidia-cutlass-dsl 4.5.0.
+torch 2.11.0+cu130, nvidia-cutlass-dsl 4.5.0. SM clock locked at 2595 MHz.
 
 ## Kernel
 
@@ -25,37 +25,43 @@ per pass), cuBLAS measured first. Correctness gated at rel-err < 2e-2 vs an fp32
 reference; measured max 2.6–3.1e-3 (cuBLAS's own bf16 error). Throughput is
 TFLOP/s = 2·M·N·K / time.
 
-Clocks float (WSL2 blocks `nvidia-smi -lgc`), so results are given two ways: vs
-cuBLAS, and vs the bf16/fp32-accumulate roofline recomputed at the SM clock
-sampled during each run. On GeForce, bf16 tensor with fp32 accumulate runs at
-512 FLOP/SM/clock — half the fp16-accumulate rate — which is 47.41 TFLOP/s at
-the 2572 MHz rated boost. The card sustains ~2.7 GHz under load, so peak is
-recomputed per run at the measured clock — dividing by the rated-clock 47.41
-instead would push the large shapes past 100%. Roofline % carries ±~2% from
-clock sampling.
+The SM clock is locked at 2595 MHz from the Windows host (`nvidia-smi -lgc`); the
+WSL2 workload inherits the physical GPU's locked clock, which WSL2 itself cannot
+set. Both kernels therefore run at the same fixed clock. The roofline is fixed
+too: on GeForce, bf16 tensor with fp32 accumulate runs at 512 FLOP/SM/clock —
+half the fp16-accumulate rate — which is **47.8 TFLOP/s** at 36 SM × 2595 MHz.
 
 ## Results
 
-| M,N,K | config | TFLOP/s | vs cuBLAS | vs roofline | |
-|---|---|---|---|---|---|
-| 512,512,512 | 64³ o2 | 25.0 | 100.5% | 48% | tie |
-| 1024,1024,1024 | 128³ | 40.2 | 99.9% | 78% | tie |
-| 2048,2048,2048 | 64³ o2 | 46.7 | 98.1% | 91% | tie |
-| 8192,1024,1024 | 128³ | 46.1 | 98.4% | 91% | tie |
-| 4096,4096,512 | 128³ | 46.3 | 102.9% | 92% | win |
-| 4096,4096,4096 | 128³ SK | 49.2 | 105.1% | 98% | win |
-| 6144,4096,4096 | 128³ N | 49.3 | 105.6% | 99% | win |
-| 8192,8192,8192 | 128³ SK | 49.1 | 104.6% | 100% | win |
-| 8192,4096,11008 | 128³ N SK | 49.3 | 105.0% | 100% | win |
-| 2048,8192,8192 | 128³ | 49.6 | 106.2% | 100% | win |
-| 16384,4096,4096 | 128³ N | 49.7 | 106.4% | 100% | win |
+| M,N,K | config | TFLOP/s | vs cuBLAS | vs roofline |
+|---|---|---|---|---|
+| 512,512,512 | 64³ o2 | 21.7 | 93.3% | 46% |
+| 1024,1024,1024 | 128³ | 37.3 | 99.9% | 79% |
+| 2048,2048,2048 | 64³ o2 | 43.3 | 96.0% | 91% |
+| 4096,4096,4096 | 128³ | 45.7 | 97.5% | 96% |
+| 8192,8192,8192 | 128³ | 46.0 | 99.3% | 96% |
+| 8192,4096,11008 | 128³ N | 46.2 | 98.8% | 97% |
+| 2048,8192,8192 | 128³ | 46.0 | 97.6% | 96% |
+| 16384,4096,4096 | 128³ N | 46.6 | 99.2% | 97% |
+| 4096,4096,512 | 128³ | 42.8 | 97.2% | 90% |
+| 8192,1024,1024 | 128³ | 42.7 | 94.6% | 90% |
+| 6144,4096,4096 | 128³ N | 46.3 | 98.6% | 97% |
 
-**7 win / 4 tie / 0 loss.** Run-to-run σ is 0.1–0.3%; the kernel is steadier than
-cuBLAS, whose σ reaches 1.3%. The wins are the large compute-bound shapes, all at
-98–100% of the roofline — the same ceiling cuBLAS hits, so the +3–6% over cuBLAS
-is real but small. The ties are the small, thin, and latency-bound shapes, at
-parity with cuBLAS. The small and thin-K shapes use a 128-tile; a 64-tile
-under-fills them.
+cuBLAS is faster or equal on every shape; this kernel reaches **93–99% of cuBLAS
+(46–97% of the roofline)**. The large compute-bound shapes come closest — 97–99%
+of cuBLAS at 96–97% of the roofline, with 8192³ and 16384×4096×4096 at 99%. The
+small and thin shapes trail more (93–97%), where cuBLAS uses specialized split-K
+kernels. Run-to-run σ is 0.1–0.5%.
+
+Why the last few percent goes to cuBLAS: both kernels use the same Ampere-class
+tensor path (`ldmatrix.x4` + `mma.sync m16n8k16`, fp32 accumulate — sm_120 has no
+tcgen05/UMMA), and both sit near the fp32-accumulate HMMA-pipe ceiling. cuBLAS
+closes the gap with a smaller tile and deeper pipeline (its 2048³ kernel is
+64×64 / 6-stage, while a 128-tile here fits only 2 stages, so its memory latency
+is less hidden), per-shape kernel selection, and SASS-level instruction
+scheduling. Matching cuBLAS to within a few percent on standard dense bf16 is the
+realistic ceiling; the value is a competitive kernel that can be modified and
+fused into (epilogue fusion, FP8/NVFP4), which cuBLAS does not cover.
 
 ## Stream-K
 
@@ -67,16 +73,16 @@ non-multiple of 36 SMs) with deep K.
 | M,N,K | 128-tiles | 128³ DP | 128³ SK | 64³ DP |
 |---|---|---|---|---|
 | 768,1024,8192 | 48 (1.3 wave) | 65% | 85% | 84% |
-| 640,1152,8192 | 45 (1.3 wave) | 61% | 81% | 94% |
-| 1152,1152,8192 | 81 (2.3 wave) | 73% | 88% | 79% |
+| 640,1152,8192 | 45 (1.3 wave) | 62% | 83% | 95% |
+| 1152,1152,8192 | 81 (2.3 wave) | 74% | 89% | 83% |
 
 (% of roofline.) Here the 128-tile data-parallel kernel wave-quantizes hard
-(61–73%) — the tail wave leaves most SMs idle — and stream-K recovers +20–34%. A
+(62–74%) — the tail wave leaves most SMs idle — and stream-K recovers +20–34%. A
 smaller 64-tile is an alternative (more tiles, less quantization) and sometimes
-wins outright, so benchmark both `:sk` and a 64-tile. On the large benchmark
-shapes (many tiles, near-integer waves) stream-K is within noise of data-parallel:
-the persistent scheduler already absorbs the tail. Stream-K also needs deep K —
-with shallow K the fixup overhead outweighs the gain.
+wins outright, so benchmark both `:sk` and a 64-tile. On the main benchmark
+shapes (many tiles, near-integer waves) stream-K is within noise of data-parallel
+and is not used: the persistent scheduler already absorbs the tail. Stream-K also
+needs deep K — with shallow K the fixup overhead outweighs the gain.
 
 Correctness needed three sm_120 memory-ordering facts: relaxed `red.global` is
 not ordered by a later fence or release (partials use plain stores under the
@@ -88,12 +94,13 @@ fold uses `ld.relaxed.gpu`); the flag is a release-increment / acquire-poll.
 
 `64³ o2` = 64×64×64 tile, atom (4,1,1), epilogue stage 2, occupancy 2 (grid 72).
 `128³` = 128×128×64 tile, epilogue stage 8, occupancy 1 (grid 36). `N` = raster
-along N. `SK` = stream-K. bench.py config strings: `64,64,64:4,1,1:e2:o2`,
-`128,128,64:n:sk` (`sk` = stream-K, `xN` = extra stream-K waves, `k8` = m16n8k8).
+along N. bench.py config strings: `64,64,64:4,1,1:e2:o2`, `128,128,64:n`,
+`128,128,64:sk` (`sk` = stream-K, `xN` = extra stream-K waves, `k8` = m16n8k8).
 
 ## Caveats
 
-- No clock lock under WSL2; ratios inside ~100±1.5% are parity.
+- Clock locked at 2595 MHz from the Windows host; WSL2 cannot set GPU clocks
+  itself (the host driver owns clock management) but inherits the host's lock.
 - Stream-K enforces one CTA per SM: with two co-resident, the fixup path corrupts
   the sibling CTA's in-flight fragments (reproducible; root cause not established
   without compute-sanitizer under WSL2/WDDM). Excluded by construction.
